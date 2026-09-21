@@ -201,6 +201,10 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
   // Counter to track hydration versions and prevent race conditions
   // when multiple rehydrate() calls happen concurrently
   let hydrationVersion = 0
+  // Whether a hydration chain is currently running
+  let hydrationInProgress = false
+  // Whether a state write reached storage while a hydration was in flight
+  let writeDuringHydration = false
   const hydrationListeners = new Set<PersistListener<S>>()
   const finishHydrationListeners = new Set<PersistListener<S>>()
   let storage = options.storage
@@ -220,6 +224,9 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
 
   const setItem = () => {
     const state = options.partialize({ ...get() })
+    if (hydrationInProgress) {
+      writeDuringHydration = true
+    }
     return (storage as PersistStorage<S, unknown>).setItem(options.name, {
       state,
       version: options.version,
@@ -261,13 +268,20 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
     // Increment version to invalidate any in-flight hydration
     const currentVersion = ++hydrationVersion
     hasHydrated = false
+    hydrationInProgress = true
+    writeDuringHydration = false
     hydrationListeners.forEach((cb) => cb(get() ?? configResult))
 
     const postRehydrationCallback =
       options.onRehydrateStorage?.(get() ?? configResult) || undefined
 
+    let migrated = false
+    // A synchronous storage resolves the whole chain while it is being
+    // assembled, so this stays false for the synchronous hydration path.
+    let chainAssembled = false
+
     // bind is used to avoid `TypeError: Illegal invocation` error
-    return toThenable(storage.getItem.bind(storage))(options.name)
+    const hydration = toThenable(storage.getItem.bind(storage))(options.name)
       .then((deserializedStorageValue) => {
         if (deserializedStorageValue) {
           if (
@@ -298,14 +312,15 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
         if (currentVersion !== hydrationVersion) {
           return
         }
-        const [migrated, migratedState] = migrationResult
+        const [didMigrate, migratedState] = migrationResult
+        migrated = didMigrate
         stateFromStorage = options.merge(
           migratedState as S,
           get() ?? configResult,
         )
 
         set(stateFromStorage as S, true)
-        if (migrated) {
+        if (didMigrate) {
           return setItem()
         }
       })
@@ -316,12 +331,23 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
         }
         postRehydrationCallback?.(get(), undefined)
 
+        // A write that raced with an asynchronous hydration has already been
+        // persisted, but the hydration result wins in memory. Persist the
+        // landed state once more so memory and storage hold the same value.
+        // Nothing can interleave with a synchronous hydration, and that path
+        // must not touch storage on its own.
+        if (chainAssembled && !migrated && writeDuringHydration) {
+          setItem()
+        }
+
         // It's possible that 'postRehydrationCallback' updated the state. To ensure
         // that isn't overwritten when returning 'stateFromStorage' below
         // (synchronous-case only), update 'stateFromStorage' to point to the latest
         // state. In the asynchronous case, 'stateFromStorage' isn't used after this
         // callback, so there's no harm in updating it to match the latest state.
         stateFromStorage = get()
+        hydrationInProgress = false
+        writeDuringHydration = false
         hasHydrated = true
         finishHydrationListeners.forEach((cb) => cb(stateFromStorage as S))
       })
@@ -331,7 +357,12 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
           return
         }
         postRehydrationCallback?.(undefined, e)
+        hydrationInProgress = false
+        writeDuringHydration = false
       })
+
+    chainAssembled = true
+    return hydration
   }
 
   ;(api as StoreApi<S> & StorePersist<StoreApi<S>, S, unknown>).persist = {
