@@ -184,6 +184,12 @@ const toThenable =
     }
   }
 
+const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+  (typeof value === 'object' || typeof value === 'function') &&
+  value !== null &&
+  'then' in value &&
+  typeof (value as { then: unknown }).then === 'function'
+
 const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
   type S = ReturnType<typeof config>
   let options = {
@@ -218,7 +224,16 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
     )
   }
 
-  const setItem = () => {
+  // Monotonic token bumped on every user-initiated write plus the set of
+  // asynchronous user writes still in flight. A hydration that observed a
+  // write racing with it reconciles its in-memory result back to storage once
+  // that write has settled (serialized behind it), so both sides never
+  // disagree.
+  let writeToken = 0
+  const pendingUserWrites = new Set<number>()
+  let lastWrite: Promise<unknown> = Promise.resolve()
+
+  const invokeSetItem = () => {
     const state = options.partialize({ ...get() })
     return (storage as PersistStorage<S, unknown>).setItem(options.name, {
       state,
@@ -226,17 +241,42 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
     })
   }
 
+  const setItem = (internal = false) => {
+    if (internal) {
+      return invokeSetItem()
+    }
+    const token = ++writeToken
+    const result = invokeSetItem()
+    if (!isThenable(result)) {
+      return result
+    }
+    pendingUserWrites.add(token)
+    const completion = Promise.resolve(result).then(
+      () => {
+        pendingUserWrites.delete(token)
+      },
+      () => {
+        pendingUserWrites.delete(token)
+      },
+    )
+    lastWrite = lastWrite.then(
+      () => completion,
+      () => completion,
+    )
+    return result
+  }
+
   const savedSetState = api.setState
 
   api.setState = (state, replace) => {
     savedSetState(state, replace as any)
-    return setItem()
+    return setItem(false)
   }
 
   const configResult = config(
     (...args) => {
       set(...(args as Parameters<typeof set>))
-      return setItem()
+      return setItem(false)
     },
     get,
     api,
@@ -260,6 +300,11 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
 
     // Increment version to invalidate any in-flight hydration
     const currentVersion = ++hydrationVersion
+    // Snapshot of user writes at hydration start. A later write token, or an
+    // in-flight asynchronous write that is still pending, means a write raced
+    // with the hydration and must be reconciled once hydration lands.
+    const writesAtStart = writeToken
+    const pendingWritesAtStart = new Set(pendingUserWrites)
     hasHydrated = false
     hydrationListeners.forEach((cb) => cb(get() ?? configResult))
 
@@ -306,7 +351,8 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
 
         set(stateFromStorage as S, true)
         if (migrated) {
-          return setItem()
+          setItem(true)
+          return
         }
       })
       .then(() => {
@@ -324,6 +370,41 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
         stateFromStorage = get()
         hasHydrated = true
         finishHydrationListeners.forEach((cb) => cb(stateFromStorage as S))
+
+        const tokenAtLanding = writeToken
+        // If a user write raced with this hydration, the unconditional set
+        // above made memory win while the in-flight write may still be landing
+        // on storage. Persist the merged state that won in memory, waiting for
+        // every in-flight user write to settle first so storage can't keep the
+        // stale value. Migration already wrote the migrated state above.
+        const writeStartedDuringHydration = writeToken !== writesAtStart
+        const preHydrationWriteStillPending = [...pendingWritesAtStart].some(
+          (token) => pendingUserWrites.has(token),
+        )
+        const writeRaced =
+          writeStartedDuringHydration || preHydrationWriteStillPending
+        if (!writeRaced) {
+          return
+        }
+        const persistWinner = () => {
+          // A newer hydration, or a fresh write that already captured the
+          // merged state, supersedes this reconciliation.
+          if (
+            currentVersion !== hydrationVersion ||
+            writeToken !== tokenAtLanding
+          ) {
+            return
+          }
+          return Promise.resolve(setItem(true))
+        }
+        // A racing write still in flight must settle first; defer the
+        // reconciliation storage call until it does, otherwise the two calls
+        // could land out of order.
+        if (!preHydrationWriteStillPending && pendingUserWrites.size === 0) {
+          persistWinner()
+          return
+        }
+        return lastWrite.then(persistWinner, persistWinner)
       })
       .catch((e: Error) => {
         // Abort if a newer hydration has started
